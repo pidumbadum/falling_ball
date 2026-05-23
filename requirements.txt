@@ -1,0 +1,2 @@
+pygame-ce==2.5.2
+pymunk==6.7.0
