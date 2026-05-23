@@ -3,19 +3,22 @@ ball_projector.py
 =================
 Единый файл: захват препятствий с камеры → физика pymunk → отрисовка pygame.
 
-Управление:
+Два окна:
+  • OpenCV  "Оператор"  — живая камера / снимок с линиями (на экране оператора)
+  • pygame  "Проектор"  — только шарик на чёрном фоне    (на проекторе)
+
+Управление (фокус на любом окне):
   ПРОБЕЛ  — сделать снимок с камеры, найти линии и запустить шарик
   R       — сбросить шарик (без нового снимка)
-  ESC     — выход
+  ESC / Q — выход
 """
 
 import sys
-import math
 import cv2
 import numpy as np
 import pygame
 import pymunk
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
 
@@ -25,11 +28,17 @@ from typing import List, Tuple, Optional
 
 @dataclass
 class Config:
-    # Камера / окно
+    # Камера
     cam_width: int = 800
     cam_height: int = 600
     camera_index: int = 0
-    fullscreen: bool = False          # True — полноэкранный режим для проектора
+
+    # Окно проектора (pygame).
+    # projector_fullscreen = True  →  занимает весь второй монитор
+    # projector_fullscreen = False →  обычное окно projector_width × projector_height
+    projector_fullscreen: bool = False
+    projector_width: int = 800
+    projector_height: int = 600
 
     # Шарик
     ball_radius: float = 20
@@ -49,24 +58,23 @@ class Config:
     surface_thickness: float = 5.0
 
     # Детектор линий
-    min_segment_length: int = 30      # мин. длина отрезка (px)
+    min_segment_length: int = 30
 
-    # Визуал
-    bg_color: Tuple[int, int, int] = (0, 0, 0)
-    ball_color: Tuple[int, int, int] = (255, 80, 80)
-    line_color: Tuple[int, int, int] = (0, 200, 255)
-    preview_ball_color: Tuple[int, int, int] = (255, 255, 0)
+    # Цвета окна оператора (OpenCV, BGR)
+    op_line_color: Tuple[int, int, int] = (0, 255, 0)
+    op_ball_color: Tuple[int, int, int] = (0, 255, 255)
+
+    # Цвета окна проектора (pygame, RGB)
+    proj_bg_color: Tuple[int, int, int] = (0, 0, 0)
+    proj_ball_color: Tuple[int, int, int] = (255, 80, 80)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 2. ДЕТЕКТОР ЛИНИЙ (из hackathon.py)
+# 2. ДЕТЕКТОР ЛИНИЙ
 # ══════════════════════════════════════════════════════════════════
 
 def find_lines(frame: np.ndarray, min_length: int = 30) -> List[Tuple[np.ndarray, np.ndarray]]:
-    """
-    Обнаруживает чёрные линии на кадре и возвращает список отрезков [(a, b), ...].
-    a, b — numpy-массивы float64 с координатами концов.
-    """
+    """Обнаруживает тёмные линии на кадре, возвращает список отрезков [(a, b), ...]."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
     kernel = np.ones((3, 3), np.uint8)
@@ -90,12 +98,10 @@ def find_lines(frame: np.ndarray, min_length: int = 30) -> List[Tuple[np.ndarray
 
 
 # ══════════════════════════════════════════════════════════════════
-# 3. ФИЗИЧЕСКИЙ СИМУЛЯТОР (из class_ball.py)
+# 3. ФИЗИЧЕСКИЙ СИМУЛЯТОР
 # ══════════════════════════════════════════════════════════════════
 
 class BallSimulator:
-    """Управляет физическим пространством pymunk."""
-
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.space = pymunk.Space()
@@ -104,20 +110,13 @@ class BallSimulator:
         self.balls: List[dict] = []
         self.paused = False
 
-    # ── Поверхности ──────────────────────────────────────────────
-
     def clear_surfaces(self):
         for s in self.surfaces:
             self.space.remove(s)
         self.surfaces.clear()
 
-    def add_segment(self, p1: Tuple[float, float], p2: Tuple[float, float]) -> pymunk.Shape:
-        """Добавить статический отрезок-поверхность."""
-        shape = pymunk.Segment(
-            self.space.static_body,
-            p1, p2,
-            self.cfg.surface_thickness,
-        )
+    def add_segment(self, p1, p2) -> pymunk.Shape:
+        shape = pymunk.Segment(self.space.static_body, p1, p2, self.cfg.surface_thickness)
         shape.elasticity = self.cfg.surface_elasticity
         shape.friction = self.cfg.surface_friction
         self.space.add(shape)
@@ -125,54 +124,40 @@ class BallSimulator:
         return shape
 
     def load_segments(self, segments: List[Tuple[np.ndarray, np.ndarray]]):
-        """Загрузить список отрезков (из детектора линий) как поверхности."""
         self.clear_surfaces()
         for a, b in segments:
             self.add_segment(tuple(a), tuple(b))
-
-    # ── Шарики ───────────────────────────────────────────────────
 
     def clear_balls(self):
         for ball in self.balls:
             self.space.remove(ball["body"], ball["shape"])
         self.balls.clear()
 
-    def add_ball(self, position: Tuple[float, float],
-                 velocity: Optional[Tuple[float, float]] = None) -> dict:
-        """Добавить динамический шар."""
+    def add_ball(self, position, velocity=None) -> dict:
         cfg = self.cfg
         inertia = pymunk.moment_for_circle(cfg.ball_mass, 0, cfg.ball_radius)
         body = pymunk.Body(cfg.ball_mass, inertia)
         body.position = position
         if velocity:
             body.velocity = velocity
-
         shape = pymunk.Circle(body, cfg.ball_radius)
         shape.elasticity = cfg.ball_elasticity
         shape.friction = cfg.ball_friction
-
         self.space.add(body, shape)
         ball_data = {"body": body, "shape": shape, "radius": cfg.ball_radius}
         self.balls.append(ball_data)
         return ball_data
 
     def reset_ball(self):
-        """Удалить все шары и добавить один на стартовую позицию."""
         self.clear_balls()
         self.add_ball(self.cfg.start_pos)
 
-    # ── Шаг симуляции ─────────────────────────────────────────────
-
     def step(self):
         if not self.paused:
-            dt = 1.0 / self.cfg.steps_per_second
-            self.space.step(dt)
+            self.space.step(1.0 / self.cfg.steps_per_second)
 
-    def get_ball_positions(self) -> List[Tuple[float, float]]:
+    def get_ball_positions(self):
         return [b["body"].position for b in self.balls]
-
-    def get_ball_radius(self) -> float:
-        return self.cfg.ball_radius
 
     def is_offscreen(self, margin: int = 80) -> bool:
         w, h = self.cfg.cam_width, self.cfg.cam_height
@@ -184,16 +169,8 @@ class BallSimulator:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 4. ГЛАВНЫЙ ЦИКЛ (объединение всего)
+# 4. ГЛАВНЫЙ ЦИКЛ
 # ══════════════════════════════════════════════════════════════════
-
-def numpy_bgr_to_pygame(frame: np.ndarray) -> pygame.Surface:
-    """Конвертировать кадр OpenCV (BGR) в pygame Surface (RGB)."""
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    # pygame ожидает (width, height, 3), numpy даёт (height, width, 3)
-    frame_rgb = np.transpose(frame_rgb, (1, 0, 2))
-    return pygame.surfarray.make_surface(frame_rgb)
-
 
 def main():
     cfg = Config()
@@ -206,120 +183,139 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.cam_width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.cam_height)
 
-    # ── pygame ────────────────────────────────────────────────────
+    # ── Окно оператора (OpenCV) ───────────────────────────────────
+    cv2.namedWindow("Оператор", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Оператор", cfg.cam_width, cfg.cam_height)
+
+    # ── Окно проектора (pygame) ───────────────────────────────────
     pygame.init()
-    if cfg.fullscreen:
-        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    if cfg.projector_fullscreen:
+        proj_screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
     else:
-        screen = pygame.display.set_mode((cfg.cam_width, cfg.cam_height))
-    pygame.display.set_caption("Ball Projector  |  ПРОБЕЛ — снимок  R — сброс  ESC — выход")
+        proj_screen = pygame.display.set_mode((cfg.projector_width, cfg.projector_height))
+    pygame.display.set_caption("Проектор")
+    proj_w, proj_h = proj_screen.get_size()
     clock = pygame.time.Clock()
-    font = pygame.font.SysFont(None, 28)
 
     # ── Симулятор ─────────────────────────────────────────────────
     sim = BallSimulator(cfg)
     sim.reset_ball()
 
     # ── Состояние ─────────────────────────────────────────────────
-    snapshot: Optional[np.ndarray] = None      # снимок с камеры
-    snapshot_surf: Optional[pygame.Surface] = None
+    snapshot: Optional[np.ndarray] = None
     segments: List[Tuple[np.ndarray, np.ndarray]] = []
     snapshot_taken = False
     running_sim = False
 
-    screen_w, screen_h = screen.get_size()
+    # Масштаб: физика считается в координатах камеры (cam_width × cam_height),
+    # проектор может иметь другое разрешение — масштабируем при отрисовке.
+    def proj_scale():
+        return proj_w / cfg.cam_width, proj_h / cfg.cam_height
 
     while True:
-        # ── Читаем кадр ───────────────────────────────────────────
+        # ── Кадр с камеры ─────────────────────────────────────────
         ret, frame = cap.read()
         if not ret:
             print("Ошибка захвата кадра.")
             break
         frame = cv2.resize(frame, (cfg.cam_width, cfg.cam_height))
 
-        # ── События ───────────────────────────────────────────────
+        # ── Клавиши OpenCV ────────────────────────────────────────
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27 or key == ord('q'):          # ESC или Q
+            break
+        elif key == ord(' '):
+            snapshot = frame.copy()
+            segments = find_lines(snapshot, cfg.min_segment_length)
+            sim.load_segments(segments)
+            sim.reset_ball()
+            snapshot_taken = True
+            running_sim = True
+            print(f"Снимок сделан. Найдено отрезков: {len(segments)}")
+        elif key == ord('r'):
+            sim.reset_ball()
+            running_sim = snapshot_taken
+
+        # ── Клавиши pygame ────────────────────────────────────────
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                running_sim = False
                 cap.release()
+                cv2.destroyAllWindows()
                 pygame.quit()
                 sys.exit()
-
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
+                if event.key == pygame.K_ESCAPE or event.key == pygame.K_q:
                     cap.release()
+                    cv2.destroyAllWindows()
                     pygame.quit()
                     sys.exit()
-
                 elif event.key == pygame.K_SPACE:
-                    # Сделать снимок, найти линии, запустить симуляцию
                     snapshot = frame.copy()
-                    snapshot_surf = numpy_bgr_to_pygame(snapshot)
                     segments = find_lines(snapshot, cfg.min_segment_length)
                     sim.load_segments(segments)
                     sim.reset_ball()
                     snapshot_taken = True
                     running_sim = True
                     print(f"Снимок сделан. Найдено отрезков: {len(segments)}")
-
                 elif event.key == pygame.K_r:
-                    # Только сброс шарика (линии остаются)
                     sim.reset_ball()
                     running_sim = snapshot_taken
 
         # ── Шаг физики ────────────────────────────────────────────
         if running_sim:
             sim.step()
-            # Авто-сброс при выходе за экран
             if sim.is_offscreen():
                 sim.reset_ball()
 
-        # ── Отрисовка ─────────────────────────────────────────────
-        screen.fill(cfg.bg_color)
-
-        if snapshot_taken and snapshot_surf is not None:
-            # Масштабируем снимок под размер окна pygame (нужно для полноэкранного режима)
-            scaled = pygame.transform.scale(snapshot_surf, (screen_w, screen_h))
-            screen.blit(scaled, (0, 0))
-
-            # Линии поверхностей
-            sx = screen_w / cfg.cam_width
-            sy = screen_h / cfg.cam_height
+        # ═══════════════════════════════════════════════════════════
+        # ОКНО ОПЕРАТОРА — камера + линии + шарик (OpenCV)
+        # ═══════════════════════════════════════════════════════════
+        if snapshot_taken and snapshot is not None:
+            op_frame = snapshot.copy()
             for a, b in segments:
-                pa = (int(a[0] * sx), int(a[1] * sy))
-                pb = (int(b[0] * sx), int(b[1] * sy))
-                pygame.draw.line(screen, cfg.line_color, pa, pb, 3)
+                cv2.line(op_frame, tuple(a.astype(int)), tuple(b.astype(int)),
+                         cfg.op_line_color, 2)
         else:
-            # Режим предпросмотра — живая картинка с камеры
-            live_surf = numpy_bgr_to_pygame(frame)
-            scaled = pygame.transform.scale(live_surf, (screen_w, screen_h))
-            screen.blit(scaled, (0, 0))
+            op_frame = frame.copy()
+            cv2.putText(op_frame, "ПРОБЕЛ — снимок и запуск",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
 
-        # Шарики
-        sx = screen_w / cfg.cam_width
-        sy = screen_h / cfg.cam_height
+        # Шарик на кадре оператора
+        for pos in sim.get_ball_positions():
+            cx, cy = int(pos.x), int(pos.y)
+            cv2.circle(op_frame, (cx, cy), int(cfg.ball_radius), cfg.op_ball_color, -1)
+
+        if snapshot_taken:
+            cv2.putText(op_frame, f"R-сброс  ESC-выход  линий:{len(segments)}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2)
+
+        cv2.imshow("Оператор", op_frame)
+
+        # ═══════════════════════════════════════════════════════════
+        # ОКНО ПРОЕКТОРА — только шарик на чёрном (pygame)
+        # ═══════════════════════════════════════════════════════════
+        proj_screen.fill(cfg.proj_bg_color)
+
+        sx, sy = proj_scale()
         ball_r_px = int(cfg.ball_radius * min(sx, sy))
+
         for pos in sim.get_ball_positions():
             draw_x = int(pos.x * sx)
             draw_y = int(pos.y * sy)
-            # Тень
-            pygame.draw.circle(screen, (30, 30, 30), (draw_x + 3, draw_y + 4), ball_r_px)
-            # Шарик
-            pygame.draw.circle(screen, cfg.ball_color, (draw_x, draw_y), ball_r_px)
-            # Блик
-            pygame.draw.circle(screen, (255, 200, 200),
+            pygame.draw.circle(proj_screen, cfg.proj_ball_color, (draw_x, draw_y), ball_r_px)
+            # Блик — единственный визуальный элемент помимо шарика
+            highlight_r = max(2, ball_r_px // 4)
+            pygame.draw.circle(proj_screen, (255, 200, 200),
                                 (draw_x - ball_r_px // 4, draw_y - ball_r_px // 4),
-                                max(2, ball_r_px // 4))
-
-        # Подсказка
-        if not snapshot_taken:
-            hint = font.render("ПРОБЕЛ — снимок с камеры и запуск шарика", True, (220, 220, 220))
-            screen.blit(hint, (10, 10))
-        else:
-            hint = font.render(f"R — сброс   ESC — выход   линий: {len(segments)}", True, (180, 180, 180))
-            screen.blit(hint, (10, 10))
+                                highlight_r)
 
         pygame.display.flip()
         clock.tick(cfg.steps_per_second)
+
+    cap.release()
+    cv2.destroyAllWindows()
+    pygame.quit()
 
 
 if __name__ == "__main__":
