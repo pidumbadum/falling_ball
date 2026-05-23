@@ -6,17 +6,17 @@ ball_projector.py
 
 Два окна:
   • OpenCV  "Оператор"  — живая камера, выделение ROI, снимок с линиями + шарик
-  • pygame  "Проектор"  — только шарик на чёрном фоне (для проектора)
+  • pygame  "Проектор"  — шарик на чёрном фоне, отрисовка ТОЛЬКО в ROI-зоне
 
 Управление:
   Мышь     — нарисовать прямоугольник ROI (зону с препятствиями)
   ПРОБЕЛ   — сделать снимок, найти линии в ROI и запустить шарик
   R        — сбросить шарик
-  C        — сбросить ROI (выделить заново)
+  C        — сбросить ROI (вернуться в полноэкранный режим)
   ESC / Q  — выход
 
-Координаты физики считаются в пространстве ПРОЕКТОРА (projector_width × projector_height).
-ROI на кадре камеры масштабируется в это пространство — шарик не обрезается.
+Координаты физики считаются в пространстве ПРОЕКТОРА.
+При выделенном ROI физика и отрисовка ограничиваются соответствующей областью.
 """
 
 import sys
@@ -37,17 +37,17 @@ class Config:
     # Камера
     cam_width: int = 800
     cam_height: int = 600
-    camera_index: int = 1             # индекс камеры (1 + CAP_DSHOW на Windows)
-    use_dshow: bool = True            # True — использовать DirectShow (Windows)
+    camera_index: int = 1
+    use_dshow: bool = True
 
     # Окно проектора (pygame)
     projector_fullscreen: bool = False
-    projector_width: int = 800        # координатное пространство физики и проектора
+    projector_width: int = 800
     projector_height: int = 600
 
-    # Шарик — стартовая позиция задаётся в долях экрана проектора
-    ball_start_x_frac: float = 0.5   # 0.0 = левый край, 1.0 = правый
-    ball_start_y_frac: float = 0.05  # почти у верхнего края
+    # Шарик — стартовая позиция в долях ОТНОСИТЕЛЬНО текущей области (play_area или весь экран)
+    ball_start_x_frac: float = 0.5
+    ball_start_y_frac: float = 0.05
     ball_radius: float = 20
     ball_mass: float = 1.0
     ball_elasticity: float = 0.7
@@ -75,27 +75,23 @@ class Config:
     proj_bg_color: Tuple[int, int, int] = (0, 0, 0)
     proj_ball_color: Tuple[int, int, int] = (255, 80, 80)
 
-    @property
-    def ball_start_pos(self) -> Tuple[float, float]:
-        return (self.projector_width * self.ball_start_x_frac,
-                self.projector_height * self.ball_start_y_frac)
-
 
 # ══════════════════════════════════════════════════════════════════
-# 2. ДЕТЕКТОР ЛИНИЙ
+# 2. ДЕТЕКТОР ЛИНИЙ (с поддержкой play_area)
 # ══════════════════════════════════════════════════════════════════
 
 def find_lines_in_roi(
     frame: np.ndarray,
-    roi: Optional[Tuple[int, int, int, int]],   # (x1, y1, x2, y2) в пикселях камеры
+    roi: Optional[Tuple[int, int, int, int]],
     proj_w: int,
     proj_h: int,
+    play_area: Optional[Tuple[float, float, float, float]] = None,  # (x, y, w, h)
     min_length: int = 30,
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
     """
     Ищет тёмные линии внутри ROI на кадре камеры.
-    Возвращает отрезки [(a, b)] в координатах ПРОЕКТОРА (proj_w × proj_h).
-    Если ROI не задан — использует весь кадр.
+    Возвращает отрезки [(a, b)] в координатах ПРОЕКТОРА.
+    Если задан play_area — масштабирует в него, иначе — на весь экран.
     """
     h_cam, w_cam = frame.shape[:2]
 
@@ -124,23 +120,27 @@ def find_lines_in_roi(
     contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     segments: List[Tuple[np.ndarray, np.ndarray]] = []
 
-    # Масштаб: ROI-пиксели → координаты проектора
-    sx = proj_w / roi_w
-    sy = proj_h / roi_h
-    # Смещение ROI внутри кадра → тоже в координаты проектора
-    ox = roi_x * (proj_w / w_cam)
-    oy = roi_y * (proj_h / h_cam)
+    # Масштабирование: ROI-пиксели → целевая область
+    if play_area:
+        px, py, pw, ph = play_area
+        target_w, target_h = pw, ph
+        offset_x, offset_y = px, py
+    else:
+        target_w, target_h = proj_w, proj_h
+        offset_x, offset_y = 0, 0
+
+    sx = target_w / roi_w if roi_w > 0 else 0
+    sy = target_h / roi_h if roi_h > 0 else 0
 
     for cnt in contours:
         epsilon = 0.01 * cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, epsilon, True)
         points = [pt[0] for pt in approx]
         for i in range(len(points) - 1):
-            # Точки в координатах crop → координаты проектора
-            a = np.array([points[i][0] * sx + ox,
-                           points[i][1] * sy + oy], dtype=float)
-            b = np.array([points[i+1][0] * sx + ox,
-                           points[i+1][1] * sy + oy], dtype=float)
+            a = np.array([points[i][0] * sx + offset_x,
+                          points[i][1] * sy + offset_y], dtype=float)
+            b = np.array([points[i+1][0] * sx + offset_x,
+                          points[i+1][1] * sy + offset_y], dtype=float)
             if np.linalg.norm(b - a) >= min_length:
                 segments.append((a, b))
 
@@ -159,6 +159,22 @@ class BallSimulator:
         self.surfaces: List[pymunk.Shape] = []
         self.balls: List[dict] = []
         self.paused = False
+        self.play_area: Optional[Tuple[float, float, float, float]] = None  # (x, y, w, h)
+
+    def set_play_area(self, area: Optional[Tuple[float, float, float, float]]):
+        """Установить область игры в координатах проектора."""
+        self.play_area = area
+
+    def _compute_start_pos(self) -> Tuple[float, float]:
+        """Вычислить стартовую позицию шарика с учётом play_area."""
+        cfg = self.cfg
+        if self.play_area:
+            x, y, w, h = self.play_area
+            return (x + cfg.ball_start_x_frac * w,
+                    y + cfg.ball_start_y_frac * h)
+        else:
+            return (cfg.projector_width * cfg.ball_start_x_frac,
+                    cfg.projector_height * cfg.ball_start_y_frac)
 
     def clear_surfaces(self):
         for s in self.surfaces:
@@ -197,7 +213,7 @@ class BallSimulator:
 
     def reset_ball(self):
         self.clear_balls()
-        self.add_ball(self.cfg.ball_start_pos)
+        self.add_ball(self._compute_start_pos())
 
     def step(self):
         if not self.paused:
@@ -214,19 +230,26 @@ class BallSimulator:
                 return True
         return False
 
+    def is_outside_play_area(self, pos, margin: float = 5.0) -> bool:
+        """Проверить, вышел ли шарик за пределы play_area (если задана)."""
+        if not self.play_area:
+            return False
+        px, py, pw, ph = self.play_area
+        x, y = pos
+        return (x < px - margin or x > px + pw + margin or
+                y < py - margin or y > py + ph + margin)
+
 
 # ══════════════════════════════════════════════════════════════════
 # 4. ВЫДЕЛЕНИЕ ROI МЫШЬЮ
 # ══════════════════════════════════════════════════════════════════
 
 class ROISelector:
-    """Позволяет пользователю нарисовать прямоугольник мышью на окне OpenCV."""
-
     def __init__(self):
         self.drawing = False
         self.start: Optional[Tuple[int, int]] = None
         self.end: Optional[Tuple[int, int]] = None
-        self.confirmed: Optional[Tuple[int, int, int, int]] = None  # (x1,y1,x2,y2)
+        self.confirmed: Optional[Tuple[int, int, int, int]] = None
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -246,7 +269,6 @@ class ROISelector:
                                   max(x1, x2), max(y1, y2))
 
     def draw_on(self, frame: np.ndarray, color=(0, 255, 255)):
-        """Нарисовать текущий прямоугольник на кадре."""
         roi = self.confirmed or (
             (self.start[0], self.start[1], self.end[0], self.end[1])
             if self.drawing and self.start and self.end else None
@@ -269,7 +291,7 @@ def main():
 
     # ── Камера ────────────────────────────────────────────────────
     cam_id = cfg.camera_index + cv2.CAP_DSHOW if cfg.use_dshow else cfg.camera_index
-    cap = cv2.VideoCapture(cam_id)
+    cap = cv2.VideoCapture(cam_id) #0
     if not cap.isOpened():
         print("Ошибка: не удалось открыть камеру.")
         sys.exit(1)
@@ -284,7 +306,7 @@ def main():
     roi_sel = ROISelector()
     cv2.setMouseCallback(WIN, roi_sel.mouse_callback)
 
-    # ── Окно проектора (pygame) — только шарик на чёрном ─────────
+    # ── Окно проектора (pygame) ─────────────────────────────────
     pygame.init()
     if cfg.projector_fullscreen:
         proj_screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
@@ -304,15 +326,7 @@ def main():
     segments: List[Tuple[np.ndarray, np.ndarray]] = []
     snapshot_taken = False
     running_sim = False
-
-    # Масштаб: координаты проектора → пиксели окна оператора (для отрисовки шарика у оператора)
-    def op_scale():
-        h, w = frame.shape[:2]
-        return w / cfg.projector_width, h / cfg.projector_height
-
-    # Масштаб: координаты проектора → пиксели окна pygame
-    sx_proj = proj_w / cfg.projector_width
-    sy_proj = proj_h / cfg.projector_height
+    play_area: Optional[Tuple[float, float, float, float]] = None  # (x, y, w, h)
 
     frame = np.zeros((cfg.cam_height, cfg.cam_width, 3), dtype=np.uint8)
 
@@ -328,29 +342,52 @@ def main():
             break
         elif key == ord(' '):
             snapshot = frame.copy()
+            
+            # Вычисляем play_area: ROI с камеры → прямоугольник на проекторе
+            if roi_sel.confirmed:
+                x1, y1, x2, y2 = roi_sel.confirmed
+                fx1 = x1 / cfg.cam_width
+                fy1 = y1 / cfg.cam_height
+                fw = (x2 - x1) / cfg.cam_width
+                fh = (y2 - y1) / cfg.cam_height
+                px = fx1 * cfg.projector_width
+                py = fy1 * cfg.projector_height
+                pw = fw * cfg.projector_width
+                ph = fh * cfg.projector_height
+                play_area = (px, py, pw, ph)
+            else:
+                play_area = None
+            
             segments = find_lines_in_roi(
                 snapshot,
                 roi_sel.confirmed,
                 cfg.projector_width, cfg.projector_height,
-                cfg.min_segment_length,
+                play_area=play_area,
+                min_length=cfg.min_segment_length,
             )
+            sim.set_play_area(play_area)
             sim.load_segments(segments)
             sim.reset_ball()
             snapshot_taken = True
             running_sim = True
-            print(f"Снимок. ROI={roi_sel.confirmed}. Отрезков: {len(segments)}")
+            area_info = f"ROI={roi_sel.confirmed}" if roi_sel.confirmed else "FULL"
+            print(f"Снимок. Область: {area_info}. Отрезков: {len(segments)}")
+            
         elif key == ord('r'):
             sim.reset_ball()
             running_sim = snapshot_taken
         elif key == ord('c'):
             roi_sel.reset()
+            play_area = None
             snapshot_taken = False
             running_sim = False
+            sim.set_play_area(None)
             sim.reset_ball()
 
         # ── Клавиши pygame ────────────────────────────────────────
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                running_sim = False
                 break
             elif event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
@@ -360,12 +397,27 @@ def main():
                     sys.exit()
                 elif event.key == pygame.K_SPACE:
                     snapshot = frame.copy()
+                    if roi_sel.confirmed:
+                        x1, y1, x2, y2 = roi_sel.confirmed
+                        fx1 = x1 / cfg.cam_width
+                        fy1 = y1 / cfg.cam_height
+                        fw = (x2 - x1) / cfg.cam_width
+                        fh = (y2 - y1) / cfg.cam_height
+                        px = fx1 * cfg.projector_width
+                        py = fy1 * cfg.projector_height
+                        pw = fw * cfg.projector_width
+                        ph = fh * cfg.projector_height
+                        play_area = (px, py, pw, ph)
+                    else:
+                        play_area = None
                     segments = find_lines_in_roi(
                         snapshot,
                         roi_sel.confirmed,
                         cfg.projector_width, cfg.projector_height,
-                        cfg.min_segment_length,
+                        play_area=play_area,
+                        min_length=cfg.min_segment_length,
                     )
+                    sim.set_play_area(play_area)
                     sim.load_segments(segments)
                     sim.reset_ball()
                     snapshot_taken = True
@@ -377,7 +429,10 @@ def main():
         # ── Шаг физики ────────────────────────────────────────────
         if running_sim:
             sim.step()
-            if sim.is_offscreen():
+            # Сброс, если шарик улетел за пределы play_area (если задана)
+            if play_area and any(sim.is_outside_play_area(pos) for pos in sim.get_ball_positions()):
+                sim.reset_ball()
+            elif sim.is_offscreen():
                 sim.reset_ball()
 
         # ══════════════════════════════════════════════════════════
@@ -387,6 +442,7 @@ def main():
             op_frame = snapshot.copy()
             # Рисуем найденные линии (в координатах камеры)
             h_op, w_op = op_frame.shape[:2]
+            # Обратное масштабирование: проектор → камера
             lsx = w_op / cfg.projector_width
             lsy = h_op / cfg.projector_height
             for a, b in segments:
@@ -412,30 +468,47 @@ def main():
         # Подсказки
         if not snapshot_taken:
             if roi_sel.confirmed:
-                tip = "ROI выделен. ПРОБЕЛ — запуск  C — сбросить ROI"
+                tip = "ROI выделен. ПРОБЕЛ — запуск  |  C — сбросить ROI"
             else:
                 tip = "Выделите зону мышью, затем нажмите ПРОБЕЛ"
         else:
-            tip = f"R-сброс  C-новый ROI  ESC-выход  линий:{len(segments)}"
+            area_tip = "ROI" if play_area else "FULL"
+            tip = f"R-сброс  |  C-новый ROI  |  ESC-выход  |  линий:{len(segments)}  |  {area_tip}"
         cv2.putText(op_frame, tip, (10, 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220, 220, 220), 2)
 
         cv2.imshow(WIN, op_frame)
 
         # ══════════════════════════════════════════════════════════
-        # ОКНО ПРОЕКТОРА (pygame) — только шарик на чёрном
+        # ОКНО ПРОЕКТОРА (pygame) — шарик ТОЛЬКО в play_area
         # ══════════════════════════════════════════════════════════
         proj_screen.fill(cfg.proj_bg_color)
 
-        ball_r_px = int(cfg.ball_radius * min(sx_proj, sy_proj))
+        # Опционально: визуализация границ play_area для отладки (закомментировано)
+        # if play_area:
+        #     px, py, pw, ph = play_area
+        #     pygame.draw.rect(proj_screen, (50, 50, 50), 
+        #                      (int(px), int(py), int(pw), int(ph)), 1)
+
+        ball_r_px = int(cfg.ball_radius * min(proj_w / cfg.projector_width, 
+                                               proj_h / cfg.projector_height))
         for pos in sim.get_ball_positions():
-            dx = int(pos.x * sx_proj)
-            dy = int(pos.y * sy_proj)
-            pygame.draw.circle(proj_screen, cfg.proj_ball_color, (dx, dy), ball_r_px)
-            # Блик
-            pygame.draw.circle(proj_screen, (255, 200, 200),
-                                (dx - ball_r_px // 4, dy - ball_r_px // 4),
-                                max(2, ball_r_px // 4))
+            dx = int(pos.x)
+            dy = int(pos.y)
+            # Рисуем только если внутри play_area (если задана) или на всём экране
+            if play_area:
+                px, py, pw, ph = play_area
+                if (px - cfg.ball_radius <= pos.x <= px + pw + cfg.ball_radius and
+                    py - cfg.ball_radius <= pos.y <= py + ph + cfg.ball_radius):
+                    pygame.draw.circle(proj_screen, cfg.proj_ball_color, (dx, dy), ball_r_px)
+                    pygame.draw.circle(proj_screen, (255, 200, 200),
+                                       (dx - ball_r_px // 4, dy - ball_r_px // 4),
+                                       max(2, ball_r_px // 4))
+            else:
+                pygame.draw.circle(proj_screen, cfg.proj_ball_color, (dx, dy), ball_r_px)
+                pygame.draw.circle(proj_screen, (255, 200, 200),
+                                   (dx - ball_r_px // 4, dy - ball_r_px // 4),
+                                   max(2, ball_r_px // 4))
 
         pygame.display.flip()
         clock.tick(cfg.steps_per_second)
